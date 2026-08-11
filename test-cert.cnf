@@ -1,0 +1,8 @@
+[ req ]
+distinguished_name = dn
+prompt = no
+
+[ dn ]
+C = ID
+O = PicoKMS Test
+CN = TEST-RSA-01
