@@ -7,7 +7,33 @@ from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone
 
 
+class AuthorizationError(ValueError):
+    """Raised when a registered key is not authorized for an operation."""
+
+
 class RegistryService:
+    ALLOWED_ALGORITHMS = {
+        "RSA": {
+            "RSA-SHA256",
+        },
+        "EC": {
+            "ECDSA-SHA256",
+        },
+    }
+
+    ALLOWED_OPERATIONS = {
+        "CSCA": {
+            "CERTIFICATE_SIGN",
+            "CRL_SIGN",
+        },
+        "DS": {
+            "DOCUMENT_SIGN",
+        },
+        "CVCA": {
+            "CV_CERTIFICATE_SIGN",
+        },
+    }
+
     def __init__(self, registry: Registry | None = None):
         self.registry = registry or Registry()
 
@@ -101,21 +127,32 @@ class RegistryService:
         return self.validate_key(entry["key_id"])
 
     def validate_signing_algorithm(self, entry: dict, algorithm: str):
-        allowed = {
-            "RSA": {"RSA-SHA256"},
-            "EC": {"ECDSA-SHA256"},
-        }
+        allowed = self.ALLOWED_ALGORITHMS.get(entry["algorithm"], set())
 
-        if algorithm not in allowed.get(entry["algorithm"], set()):
+        if algorithm not in allowed:
             raise ValueError(
                 f"signing algorithm {algorithm} is not allowed "
                 f"for {entry['algorithm']} key"
             )
 
-    def validate_signing_key(self, object_id: str, algorithm: str):
+    def validate_signing_key(
+        self,
+        object_id: str,
+        algorithm: str,
+        operation: str,
+    ):
         entry = self.validate_object(object_id)
         self.validate_signing_algorithm(entry, algorithm)
+        self.validate_operation(entry, operation)
         return entry
+
+    def validate_operation(self, entry: dict, operation: str):
+        allowed = self.ALLOWED_OPERATIONS.get(entry["role"], set())
+
+        if operation not in allowed:
+            raise AuthorizationError(
+                f"operation {operation} is not allowed for " f"{entry['role']} key"
+            )
 
     def get_key(self, key_id: str):
         return self.validate_key(key_id)
