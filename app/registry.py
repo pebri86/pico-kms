@@ -170,3 +170,42 @@ class Registry:
                 """,
                 ("RETIRED", now, key_id),
             )
+
+    def update_certificate(self, key_id: str, certificate_id: str):
+        if not key_id:
+            raise ValueError("key_id is required")
+
+        if not certificate_id:
+            raise ValueError("certificate_id is required")
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT status
+                FROM key_registry
+                WHERE key_id = ?
+                """,
+                (key_id,),
+            ).fetchone()
+
+            if row is None:
+                raise KeyError("key not registered")
+
+            if row["status"] != "ACTIVE":
+                raise ValueError(f"key is not active: {row['status']}")
+
+            conn.execute(
+                """
+                UPDATE key_registry
+                SET certificate_id = ?,
+                    updated_at = ?
+                WHERE key_id = ?
+                """,
+                (
+                    certificate_id,
+                    now,
+                    key_id,
+                ),
+            )

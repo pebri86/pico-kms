@@ -7,7 +7,7 @@ from cryptography.hazmat.primitives import serialization
 from .hsm import hsm
 from .registry_service import RegistryService, AuthorizationError
 from typing import Literal
-from .audit import audit_sign
+from .audit import audit_sign, audit_verify
 
 app = FastAPI(title="PicoHSM ePassport KMS Phase 1", version="1.0.0")
 registry_service = RegistryService()
@@ -107,8 +107,15 @@ def objects():
 def gen_rsa(r: RSA):
     try:
         k = hsm.gen_rsa(r.object_id, r.label, r.bits)
-        k.pop("public_key", None)
-        return {**k, "public_key_der": base64.b64encode(k["public_key_der"]).decode()}
+
+        return {
+            "object_id": k["object_id"],
+            "algorithm": k["algorithm"],
+            "bits": k["bits"],
+            "public_key_der": base64.b64encode(k["public_key_der"]).decode(),
+            "private_present": k["private_present"],
+        }
+
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -119,7 +126,17 @@ def gen_rsa(r: RSA):
 def gen_ec(r: EC):
     try:
         k = hsm.gen_ec(r.object_id, r.label, r.curve)
-        return {**k, "public_key_der": base64.b64encode(k["public_key_der"]).decode()}
+
+        return {
+            "object_id": k["object_id"],
+            "algorithm": k["algorithm"],
+            "curve": k["curve"],
+            "public_key_der": base64.b64encode(
+                k["public_key_der"]
+            ).decode(),
+            "private_present": k["private_present"],
+        }
+
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -179,6 +196,27 @@ def sign(i: str, r: Sign):
 
         raise HTTPException(400, str(e))
 
+    except Exception as e:
+        entry = None
+
+        try:
+            entry = registry_service.registry.get_key_by_object_id(i)
+        except Exception:
+            pass
+
+        if entry:
+            audit_sign(
+                key_id=entry["key_id"],
+                object_id=entry["object_id"],
+                role=entry["role"],
+                algorithm=r.algorithm,
+                operation=r.operation,
+                result="FAILURE",
+                reason=str(e),
+            )
+
+        raise HTTPException(503, str(e))
+
     except KeyError:
         raise HTTPException(404, "key not registered")
 
@@ -191,19 +229,84 @@ def sign(i: str, r: Sign):
 
 @app.post("/v1/phase1/keys/{i}/verify")
 def verify(i: str, r: Verify):
+    entry = None
+
     try:
+        entry = registry_service.validate_object(i)
+
+        registry_service.validate_signing_algorithm(
+            entry,
+            r.algorithm,
+        )
+
+        data = b64(r.data, "data")
+        signature = b64(r.signature, "signature")
+
+        valid = hsm.verify(
+            i,
+            r.algorithm,
+            data,
+            signature,
+        )
+
+        audit_verify(
+            key_id=entry["key_id"],
+            object_id=entry["object_id"],
+            role=entry["role"],
+            algorithm=r.algorithm,
+            result="SUCCESS" if valid else "INVALID",
+            reason=None if valid else "signature verification failed",
+        )
+
         return {
             "object_id": i,
             "algorithm": r.algorithm,
-            "valid": hsm.verify(
-                i, r.algorithm, b64(r.data, "data"), b64(r.signature, "signature")
-            ),
+            "valid": valid,
         }
-    except KeyError:
-        raise HTTPException(404, "public key not found")
-    except ValueError as e:
+
+    except HTTPException:
+        raise
+
+    except AuthorizationError as e:
+        if entry:
+            audit_verify(
+                key_id=entry["key_id"],
+                object_id=entry["object_id"],
+                role=entry["role"],
+                algorithm=r.algorithm,
+                result="DENIED",
+                reason=str(e),
+            )
+
         raise HTTPException(400, str(e))
+
+    except KeyError:
+        raise HTTPException(404, "key not registered")
+
+    except ValueError as e:
+        if entry:
+            audit_verify(
+                key_id=entry["key_id"],
+                object_id=entry["object_id"],
+                role=entry["role"],
+                algorithm=r.algorithm,
+                result="FAILURE",
+                reason=str(e),
+            )
+
+        raise HTTPException(400, str(e))
+
     except Exception as e:
+        if entry:
+            audit_verify(
+                key_id=entry["key_id"],
+                object_id=entry["object_id"],
+                role=entry["role"],
+                algorithm=r.algorithm,
+                result="FAILURE",
+                reason=str(e),
+            )
+
         raise HTTPException(503, str(e))
 
 

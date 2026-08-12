@@ -4,7 +4,8 @@ from .hsm import hsm
 from .registry import Registry
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
-from datetime import datetime, timezone
+from .clock import system_clock, Clock
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
 
 
 class AuthorizationError(ValueError):
@@ -13,29 +14,44 @@ class AuthorizationError(ValueError):
 
 class RegistryService:
     ALLOWED_ALGORITHMS = {
-        "RSA": {
-            "RSA-SHA256",
-        },
-        "EC": {
-            "ECDSA-SHA256",
-        },
+        "RSA": frozenset(
+            {
+                "RSA-SHA256",
+            }
+        ),
+        "EC": frozenset(
+            {
+                "ECDSA-SHA256",
+            }
+        ),
     }
 
     ALLOWED_OPERATIONS = {
-        "CSCA": {
-            "CERTIFICATE_SIGN",
-            "CRL_SIGN",
-        },
-        "DS": {
-            "DOCUMENT_SIGN",
-        },
-        "CVCA": {
-            "CV_CERTIFICATE_SIGN",
-        },
+        "CSCA": frozenset(
+            {
+                "CERTIFICATE_SIGN",
+                "CRL_SIGN",
+            }
+        ),
+        "DS": frozenset(
+            {
+                "DOCUMENT_SIGN",
+            }
+        ),
+        "CVCA": frozenset(
+            {
+                "CV_CERTIFICATE_SIGN",
+            }
+        ),
     }
 
-    def __init__(self, registry: Registry | None = None):
+    def __init__(
+        self,
+        registry: Registry | None = None,
+        clock: Clock = system_clock,
+    ):
         self.registry = registry or Registry()
+        self.clock = clock
 
     def validate_key(self, key_id: str):
         entry = self.registry.get_key(key_id)
@@ -69,7 +85,7 @@ class RegistryService:
                 raise ValueError("registered certificate not found")
 
             certificate = x509.load_der_x509_certificate(cert_der)
-            now = datetime.now(timezone.utc)
+            now = self.clock.now()
 
             if now < certificate.not_valid_before_utc:
                 raise ValueError("certificate is not yet valid")
@@ -90,6 +106,7 @@ class RegistryService:
                 )
 
             if entry["role"] == "CSCA":
+                self._verify_self_signed_certificate(certificate)
                 try:
                     basic_constraints = certificate.extensions.get_extension_for_class(
                         x509.BasicConstraints
@@ -130,7 +147,7 @@ class RegistryService:
         allowed = self.ALLOWED_ALGORITHMS.get(entry["algorithm"], set())
 
         if algorithm not in allowed:
-            raise ValueError(
+            raise AuthorizationError(
                 f"signing algorithm {algorithm} is not allowed "
                 f"for {entry['algorithm']} key"
             )
@@ -153,6 +170,55 @@ class RegistryService:
             raise AuthorizationError(
                 f"operation {operation} is not allowed for " f"{entry['role']} key"
             )
+
+    def _verify_self_signed_certificate(self, certificate):
+        if certificate.subject != certificate.issuer:
+            raise ValueError("CSCA certificate must be self-issued")
+
+        public_key = certificate.public_key()
+
+        try:
+            if isinstance(public_key, ec.EllipticCurvePublicKey):
+                public_key.verify(
+                    certificate.signature,
+                    certificate.tbs_certificate_bytes,
+                    ec.ECDSA(certificate.signature_hash_algorithm),
+                )
+
+            elif isinstance(public_key, rsa.RSAPublicKey):
+                public_key.verify(
+                    certificate.signature,
+                    certificate.tbs_certificate_bytes,
+                    padding.PKCS1v15(),
+                    certificate.signature_hash_algorithm,
+                )
+
+            else:
+                raise ValueError("unsupported CSCA certificate public key type")
+
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError("CSCA certificate signature verification failed") from e
+
+    def update_certificate(self, key_id: str, certificate_id: str):
+        entry = self.registry.get_key(key_id)
+
+        if entry is None:
+            raise KeyError("key not registered")
+
+        if entry["status"] != "ACTIVE":
+            raise ValueError(f"key is not active: {entry['status']}")
+
+        try:
+            hsm.cert(certificate_id)
+        except KeyError:
+            raise ValueError("certificate not found")
+
+        self.registry.update_certificate(
+            key_id,
+            certificate_id,
+        )
 
     def get_key(self, key_id: str):
         return self.validate_key(key_id)

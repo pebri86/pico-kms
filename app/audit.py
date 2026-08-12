@@ -77,3 +77,33 @@ def audit_sign(
     except Exception:
         logger.exception("AUDIT_WRITE_FAILED")
         return False
+
+
+def audit_verify(
+    *,
+    key_id: str,
+    object_id: str,
+    role: str,
+    algorithm: str,
+    result: str,
+    reason: str | None = None,
+):
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "KEY_VERIFY",
+        "key_id": key_id,
+        "object_id": object_id,
+        "role": role,
+        "algorithm": algorithm,
+        "result": result,
+    }
+
+    if reason:
+        event["reason"] = reason
+
+    try:
+        logger.info(json.dumps(event, separators=(",", ":")))
+        return True
+    except Exception:
+        logger.exception("AUDIT_WRITE_FAILED")
+        return False

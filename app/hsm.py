@@ -140,6 +140,7 @@ class HSM:
                     "object_id": i,
                     "algorithm": "EC",
                     "curve": curve.name,
+                    "public_key": k,
                     "public_key_der": k.public_bytes(
                         serialization.Encoding.DER,
                         serialization.PublicFormat.SubjectPublicKeyInfo,
