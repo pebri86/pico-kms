@@ -107,3 +107,47 @@ def audit_verify(
     except Exception:
         logger.exception("AUDIT_WRITE_FAILED")
         return False
+
+
+def audit_api_auth(
+    *,
+    result: str,
+    reason: str | None = None,
+):
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "API_AUTH",
+        "result": result,
+    }
+
+    if reason:
+        event["reason"] = reason
+
+    try:
+        logger.info(json.dumps(event, separators=(",", ":")))
+        return True
+    except Exception:
+        logger.exception("AUDIT_WRITE_FAILED")
+        return False
+
+
+def audit_admin_auth(
+    *,
+    result: str,
+    reason: str | None = None,
+):
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "ADMIN_AUTH",
+        "result": result,
+    }
+
+    if reason:
+        event["reason"] = reason
+
+    try:
+        logger.info(json.dumps(event, separators=(",", ":")))
+        return True
+    except Exception:
+        logger.exception("AUDIT_WRITE_FAILED")
+        return False
