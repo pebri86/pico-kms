@@ -60,7 +60,7 @@ We've now established the certificate management foundation.
 
 **Result: PASS — KMS-02.6**
 
-- **Endpoint:** `PUT /v1/phase1/keys/{key_id}/certificate`
+- **Endpoint:** `PUT /v1/keys/{key_id}/certificate`
 - **Service:** `RegistryService.update_certificate()` / `delete_certificate()`
 - **Guard:** certificate deletion blocked while referenced (incl. RETIRED keys)
 
@@ -105,7 +105,7 @@ certificate bound to key
 
 **Status:** ✅ COMPLETE
 
-**Design:** `GET /v1/phase1/integrity/certificates` (admin-only, read-only).
+**Design:** `GET /v1/integrity/certificates` (admin-only, read-only).
 Implemented as `RegistryService.check_certificate_inventory()`. It never
 mutates the registry or the HSM.
 
@@ -143,7 +143,7 @@ mutates the registry or the HSM.
 - audit `KEY_GENERATE` with `reason="bits=N"`
 - registry registration remains a separate operation
 
-**Endpoint:** `POST /v1/phase1/keys/generate/rsa` — 2048/3072/4096 bits.
+**Endpoint:** `POST /v1/keys/generate/rsa` — 2048/3072/4096 bits.
 
 ### KMS-03.2 — EC Key Generation
 
@@ -157,7 +157,7 @@ Same security requirements as KMS-03.1, verified:
 - audit `KEY_GENERATE` with `reason="curve=..."`
 - no private material in response
 
-**Endpoint:** `POST /v1/phase1/keys/generate/ec`.
+**Endpoint:** `POST /v1/keys/generate/ec`.
 
 ### KMS-03.3 — Key Registration
 
@@ -173,7 +173,7 @@ Same security requirements as KMS-03.1, verified:
 - duplicate `key_id` → 400, duplicate `object_id` → 400
 - audit `KEY_REGISTER` (+ `CERT_BIND` when a certificate is supplied)
 
-**Endpoint:** `POST /v1/phase1/keys/register`.
+**Endpoint:** `POST /v1/keys/register`.
 
 ---
 
@@ -197,7 +197,7 @@ This becomes the main operational KMS layer.
 - audit `KEY_SIGN` SUCCESS/DENIED
 - cryptographic errors do not leak internals
 
-**Endpoint:** `POST /v1/phase1/keys/{object_id}/sign` — RSA-SHA256, ECDSA-SHA256.
+**Endpoint:** `POST /v1/keys/{object_id}/sign` — RSA-SHA256, ECDSA-SHA256.
 
 ### KMS-04.2 — Verification
 
@@ -209,7 +209,7 @@ This becomes the main operational KMS layer.
 - cryptographically invalid / tampered signature → `{"valid": false}` (200), audit `KEY_VERIFY` `INVALID`
 - invalid input / unsupported operation → HTTP error
 
-**Endpoint:** `POST /v1/phase1/keys/{object_id}/verify`.
+**Endpoint:** `POST /v1/keys/{object_id}/verify`.
 
 ### KMS-04.3 — Operation Policy
 
@@ -307,7 +307,7 @@ Each event should contain metadata such as:
 
 **Status:** ✅ COMPLETE
 
-Formal health check `GET /v1/phase1/integrity` (admin-only, read-only):
+Formal health check `GET /v1/integrity` (admin-only, read-only):
 
 ```text
 registry ↔ HSM

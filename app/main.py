@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="PicoHSM ePassport KMS Phase 1",
+    title="PicoHSM ePassport KMS",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -234,7 +234,7 @@ def objects():
 
 
 @app.get(
-    "/v1/phase1/keys",
+    "/v1/keys",
     dependencies=[Depends(require_admin_auth)],
 )
 def list_registered_keys():
@@ -264,7 +264,7 @@ def list_registered_keys():
 
 
 @app.get(
-    "/v1/phase1/keys/{i}",
+    "/v1/keys/{i}",
     dependencies=[Depends(require_admin_auth)],
 )
 def get_registered_key(i: str):
@@ -292,7 +292,7 @@ def get_registered_key(i: str):
 
 
 @app.post(
-    "/v1/phase1/keys/register",
+    "/v1/keys/register",
     dependencies=[Depends(require_admin_auth)],
 )
 def register_key(r: RegisterKey):
@@ -354,7 +354,7 @@ def register_key(r: RegisterKey):
 
 
 @app.post(
-    "/v1/phase1/keys/{i}/retire",
+    "/v1/keys/{i}/retire",
     dependencies=[Depends(require_admin_auth)],
 )
 def retire_key(i: str):
@@ -387,7 +387,7 @@ def retire_key(i: str):
 
 
 @app.post(
-    "/v1/phase1/keys/generate/rsa",
+    "/v1/keys/generate/rsa",
     dependencies=[Depends(require_admin_auth)],
 )
 def gen_rsa(r: RSA):
@@ -419,7 +419,7 @@ def gen_rsa(r: RSA):
 
 
 @app.post(
-    "/v1/phase1/keys/generate/ec",
+    "/v1/keys/generate/ec",
     dependencies=[Depends(require_admin_auth)],
 )
 def gen_ec(r: EC):
@@ -451,7 +451,7 @@ def gen_ec(r: EC):
 
 
 @app.post(
-    "/v1/phase1/keys/{i}/sign",
+    "/v1/keys/{i}/sign",
     dependencies=[Depends(require_api_auth)],
 )
 def sign(i: str, r: Sign):
@@ -556,7 +556,7 @@ def sign(i: str, r: Sign):
 
 
 @app.post(
-    "/v1/phase1/keys/{i}/verify",
+    "/v1/keys/{i}/verify",
     dependencies=[Depends(require_api_auth)],
 )
 def verify(i: str, r: Verify):
@@ -647,7 +647,7 @@ class CertificateUpdate(BaseModel):
 
 
 @app.put(
-    "/v1/phase1/keys/{key_id}/certificate",
+    "/v1/keys/{key_id}/certificate",
     dependencies=[Depends(require_admin_auth)],
 )
 def update_key_certificate(
@@ -720,7 +720,7 @@ def update_key_certificate(
 
 
 @app.get(
-    "/v1/phase1/integrity/certificates",
+    "/v1/integrity/certificates",
     dependencies=[Depends(require_admin_auth)],
 )
 def certificate_integrity():
@@ -731,7 +731,7 @@ def certificate_integrity():
 
 
 @app.get(
-    "/v1/phase1/integrity",
+    "/v1/integrity",
     dependencies=[Depends(require_admin_auth)],
 )
 def integrity_report():
@@ -745,7 +745,7 @@ def integrity_report():
 
 
 @app.get(
-    "/v1/phase1/certificates",
+    "/v1/certificates",
     dependencies=[Depends(require_admin_auth)],
 )
 def certs():
@@ -774,7 +774,7 @@ def certs():
 
 
 @app.get(
-    "/v1/phase1/certificates/{i}",
+    "/v1/certificates/{i}",
     dependencies=[Depends(require_admin_auth)],
 )
 def cert(i: str):
@@ -796,7 +796,7 @@ def cert(i: str):
 
 
 @app.post(
-    "/v1/phase1/certificates/import",
+    "/v1/certificates/import",
     dependencies=[Depends(require_admin_auth)],
 )
 def import_cert(r: Cert):
@@ -836,7 +836,7 @@ def import_cert(r: Cert):
 
 
 @app.delete(
-    "/v1/phase1/certificates/{i}",
+    "/v1/certificates/{i}",
     dependencies=[Depends(require_admin_auth)],
 )
 def delete_cert(i: str):

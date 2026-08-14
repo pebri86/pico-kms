@@ -1,28 +1,18 @@
-# PicoHSM ePassport KMS — Complete Phase 1
+# PicoHSM ePassport KMS
 
-Completes Phase 1-A through 1-D and provides the PKCS#11 foundation used by Phase 2.
+Production KMS service backed by a Pico HSM.
 
-## Phase 1-A
-- PC/SC/OpenSC probe
-- token/slot selection
-- token information
-- mechanism inventory
+## Features
 
-## Phase 1-B
-- RSA 2048/3072/4096 generation
-- EC P-256/P-384/P-521 generation
-- private keys remain on PicoHSM
-
-## Phase 1-C
-- RSA-SHA256 sign/verify
-- ECDSA-SHA256 sign/verify
-
-## Phase 1-D
-- X.509 certificate object listing
-- certificate DER read
-- PEM/DER certificate import
-- certificate metadata inspection
-- certificate object deletion
+- RSA 2048/3072/4096 and EC P-256/P-384/P-521 generation
+- private keys never leave the HSM
+- RSA-SHA256 / ECDSA-SHA256 sign/verify
+- X.509 certificate import, listing, read and delete
+- key registry (CSCA / DS / CVCA roles) with certificate binding
+- role-aware certificate validation policy
+- registry ↔ HSM integrity diagnostics with fail-closed startup check
+- full audit trail (key and certificate events)
+- admin vs API token authorization planes
 
 ## Install
 
@@ -36,7 +26,7 @@ cp .env.example .env
 ./scripts/run.sh
 ```
 
-Keep the API on `127.0.0.1` during development. Do not put production CSCA/DS keys on this development service.
+Keep the API on `127.0.0.1`. Do not put production CSCA/DS keys on a development service.
 
 ## Probe
 
@@ -44,24 +34,40 @@ Keep the API on `127.0.0.1` during development. Do not put production CSCA/DS ke
 ./scripts/pkcs11_probe.sh
 ```
 
-OpenSC supports listing PKCS#11 slots, mechanisms and objects, key-pair generation, certificate read/write and sign/verify testing. See the OpenSC PKCS#11 documentation for module-specific commands. 
+OpenSC supports listing PKCS#11 slots, mechanisms and objects, key-pair generation, certificate read/write and sign/verify testing. See the OpenSC PKCS#11 documentation for module-specific commands.
 
 ## API
 
 ```text
-GET  /health
-GET  /v1/hsm/token
-GET  /v1/hsm/mechanisms
-GET  /v1/hsm/objects
-POST /v1/phase1/keys/generate/rsa
-POST /v1/phase1/keys/generate/ec
-POST /v1/phase1/keys/{id}/sign
-POST /v1/phase1/keys/{id}/verify
-GET  /v1/phase1/certificates
-GET  /v1/phase1/certificates/{id}
-POST /v1/phase1/certificates/import
-DELETE /v1/phase1/certificates/{id}
+GET    /health
+GET    /v1/hsm/token
+GET    /v1/hsm/mechanisms
+GET    /v1/hsm/objects
+
+GET    /v1/keys
+GET    /v1/keys/{key_id}
+POST   /v1/keys/generate/rsa
+POST   /v1/keys/generate/ec
+POST   /v1/keys/register
+POST   /v1/keys/{key_id}/retire
+PUT    /v1/keys/{key_id}/certificate
+
+POST   /v1/keys/{object_id}/sign
+POST   /v1/keys/{object_id}/verify
+
+GET    /v1/certificates
+GET    /v1/certificates/{certificate_id}
+POST   /v1/certificates/import
+DELETE /v1/certificates/{certificate_id}
+
+GET    /v1/integrity
+GET    /v1/integrity/certificates
 ```
+
+### Authorization
+
+- **Admin plane** (`PICO_KMS_ADMIN_TOKEN`): key generation/registration/retirement, certificate import/update/delete/query, registry query, integrity diagnostics.
+- **Cryptographic plane** (`PICO_KMS_API_TOKEN`): sign, verify.
 
 ## Certificate object model
 
@@ -73,12 +79,4 @@ CKO_PRIVATE_KEY  CKA_ID = DS-DEV-01
 CKO_CERTIFICATE  CKA_ID = DS-DEV-01
 ```
 
-Phase 1-D only stores public certificate material. It never imports or exports private keys.
-
-## Phase 2 boundary
-
-The next layer maps logical IDs such as `CSCA-DEV-01`, `DS-DEV-01`, and `CVCA-DEV-01` to the HSM object IDs and stores public certificate metadata in a database.
-
-## Production hardening still required
-
-mTLS, authorization, key ceremony/dual control, secure PIN handling, tamper-evident audit, rotation, HSM health monitoring, backup/recovery and operational controls are not part of Phase 1.
+The KMS only stores public certificate material. It never imports or exports private keys.
