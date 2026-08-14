@@ -151,3 +151,77 @@ def audit_admin_auth(
     except Exception:
         logger.exception("AUDIT_WRITE_FAILED")
         return False
+
+
+def audit_key_event(
+    *,
+    event: str,
+    result: str,
+    key_id: str,
+    object_id: str,
+    role: str | None = None,
+    algorithm: str,
+    reason: str | None = None,
+):
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "key_id": key_id,
+        "object_id": object_id,
+        "algorithm": algorithm,
+        "result": result,
+    }
+
+    if role is not None:
+        record["role"] = role
+
+    if reason:
+        record["reason"] = reason
+
+    try:
+        logger.info(json.dumps(record, separators=(",", ":")))
+        return True
+    except Exception:
+        logger.exception("AUDIT_WRITE_FAILED")
+        return False
+
+
+def audit_cert_event(
+    *,
+    event: str,
+    result: str,
+    certificate_id: str,
+    key_id: str | None = None,
+    object_id: str | None = None,
+    role: str | None = None,
+    algorithm: str | None = None,
+    reason: str | None = None,
+):
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "certificate_id": certificate_id,
+        "result": result,
+    }
+
+    if key_id is not None:
+        record["key_id"] = key_id
+
+    if object_id is not None:
+        record["object_id"] = object_id
+
+    if role is not None:
+        record["role"] = role
+
+    if algorithm is not None:
+        record["algorithm"] = algorithm
+
+    if reason is not None:
+        record["reason"] = reason
+
+    try:
+        logger.info(json.dumps(record, separators=(",", ":")))
+        return True
+    except Exception:
+        logger.exception("AUDIT_WRITE_FAILED")
+        return False

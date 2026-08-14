@@ -3,13 +3,17 @@ from __future__ import annotations
 from .hsm import hsm
 from .registry import Registry
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from .certificate_policy import CertificatePolicy, CertificatePolicyError
 from .clock import system_clock, Clock
-from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
 
 
 class AuthorizationError(ValueError):
     """Raised when a registered key is not authorized for an operation."""
+
+
+class IntegrityError(RuntimeError):
+    """Raised when a critical registry/HSM integrity violation is
+    detected and cryptographic operations are failed closed."""
 
 
 class RegistryService:
@@ -49,11 +53,47 @@ class RegistryService:
         self,
         registry: Registry | None = None,
         clock: Clock = system_clock,
+        certificate_policy: CertificatePolicy | None = None,
     ):
         self.registry = registry or Registry()
         self.clock = clock
+        self.certificate_policy = certificate_policy or CertificatePolicy(
+            clock=clock
+        )
+        self.fail_closed = False
+        self.integrity_issues = []
 
+    def run_startup_integrity_check(self):
+        """Detect critical registry/HSM integrity violations at startup.
+
+        On a critical violation (an ACTIVE registered key whose HSM
+        object is missing) the service FAILS CLOSED: cryptographic
+        operations are refused until the operator resolves the issue.
+        """
+        report = self.check_integrity()
+        self.integrity_issues = report["issues"]
+
+        critical = [
+            i
+            for i in report["issues"]
+            if i["type"] == "MISSING_HSM_KEY"
+            and i.get("status") == "ACTIVE"
+        ]
+
+        self.fail_closed = bool(critical)
+
+        return {
+            "fail_closed": self.fail_closed,
+            "critical_issues": len(critical),
+            "checked_at": report["checked_at"],
+        }
     def validate_key(self, key_id: str):
+        if self.fail_closed:
+            raise IntegrityError(
+                "service is failed closed: critical registry/HSM "
+                "integrity violation detected"
+            )
+
         entry = self.registry.get_key(key_id)
 
         if entry is None:
@@ -85,54 +125,12 @@ class RegistryService:
                 raise ValueError("registered certificate not found")
 
             certificate = x509.load_der_x509_certificate(cert_der)
-            now = self.clock.now()
 
-            if now < certificate.not_valid_before_utc:
-                raise ValueError("certificate is not yet valid")
-
-            if now > certificate.not_valid_after_utc:
-                raise ValueError("certificate has expired")
-
-            hsm_public_der = key["public_key_der"]
-
-            cert_public_der = certificate.public_key().public_bytes(
-                serialization.Encoding.DER,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
+            self.certificate_policy.validate(
+                certificate,
+                role=entry["role"],
+                public_key_der=key["public_key_der"],
             )
-
-            if hsm_public_der != cert_public_der:
-                raise ValueError(
-                    "registered certificate public key does not match HSM key"
-                )
-
-            if entry["role"] == "CSCA":
-                self._validate_csca_certificate(certificate)
-                self._verify_self_signed_certificate(certificate)
-                try:
-                    basic_constraints = certificate.extensions.get_extension_for_class(
-                        x509.BasicConstraints
-                    ).value
-                except x509.ExtensionNotFound:
-                    raise ValueError("CSCA certificate missing BasicConstraints")
-
-                if not basic_constraints.ca:
-                    raise ValueError("CSCA certificate must have CA=TRUE")
-
-                if basic_constraints.path_length != 0:
-                    raise ValueError("CSCA certificate must have pathLenConstraint=0")
-
-                try:
-                    key_usage = certificate.extensions.get_extension_for_class(
-                        x509.KeyUsage
-                    ).value
-                except x509.ExtensionNotFound:
-                    raise ValueError("CSCA certificate missing KeyUsage")
-
-                if not key_usage.key_cert_sign:
-                    raise ValueError("CSCA certificate must allow keyCertSign")
-
-                if not key_usage.crl_sign:
-                    raise ValueError("CSCA certificate must allow cRLSign")
 
         return entry
 
@@ -172,36 +170,6 @@ class RegistryService:
                 f"operation {operation} is not allowed for " f"{entry['role']} key"
             )
 
-    def _verify_self_signed_certificate(self, certificate):
-        if certificate.subject != certificate.issuer:
-            raise ValueError("CSCA certificate must be self-issued")
-
-        public_key = certificate.public_key()
-
-        try:
-            if isinstance(public_key, ec.EllipticCurvePublicKey):
-                public_key.verify(
-                    certificate.signature,
-                    certificate.tbs_certificate_bytes,
-                    ec.ECDSA(certificate.signature_hash_algorithm),
-                )
-
-            elif isinstance(public_key, rsa.RSAPublicKey):
-                public_key.verify(
-                    certificate.signature,
-                    certificate.tbs_certificate_bytes,
-                    padding.PKCS1v15(),
-                    certificate.signature_hash_algorithm,
-                )
-
-            else:
-                raise ValueError("unsupported CSCA certificate public key type")
-
-        except ValueError:
-            raise
-        except Exception as e:
-            raise ValueError("CSCA certificate signature verification failed") from e
-
     def update_certificate(self, key_id: str, certificate_id: str):
         entry = self.registry.get_key(key_id)
 
@@ -225,30 +193,14 @@ class RegistryService:
 
         certificate = x509.load_der_x509_certificate(cert_der)
 
-        # Certificate public key must remain cryptographically bound
-        # to the registered HSM key.
-        hsm_public_der = key["public_key_der"]
-
-        cert_public_der = certificate.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
+        # The full role-aware validation policy is applied before
+        # any registry mutation. A failed validation leaves the
+        # existing binding untouched.
+        self.certificate_policy.validate(
+            certificate,
+            role=entry["role"],
+            public_key_der=key["public_key_der"],
         )
-
-        if hsm_public_der != cert_public_der:
-            raise ValueError("certificate public key does not match HSM key")
-
-        # Certificate must currently be valid.
-        now = self.clock.now()
-
-        if now < certificate.not_valid_before_utc:
-            raise ValueError("certificate is not yet valid")
-
-        if now > certificate.not_valid_after_utc:
-            raise ValueError("certificate has expired")
-
-        # CSCA certificates have additional policy requirements.
-        if entry["role"] == "CSCA":
-            self._validate_csca_certificate(certificate)
 
         # Only modify the registry after every validation succeeds.
         self.registry.update_certificate(
@@ -256,8 +208,53 @@ class RegistryService:
             certificate_id,
         )
 
+    def delete_certificate(self, certificate_id: str):
+        if not certificate_id:
+            raise ValueError("certificate_id is required")
+
+        # Never delete a certificate that is referenced by a
+        # registered key identity, including RETIRED keys.
+        references = self.registry.find_keys_by_certificate_id(
+            certificate_id
+        )
+
+        if references:
+            key_ids = ", ".join(
+                entry["key_id"] for entry in references
+            )
+            raise ValueError(
+                f"certificate is referenced by registered key(s): {key_ids}"
+            )
+
+        try:
+            hsm.cert(certificate_id)
+        except KeyError:
+            raise KeyError("certificate not found")
+
+        try:
+            hsm.delete_cert(certificate_id)
+        except KeyError:
+            raise KeyError("certificate not found")
+
     def get_key(self, key_id: str):
         return self.validate_key(key_id)
+
+    def get_registered_key(self, key_id: str):
+        """Return registry metadata without requiring the key to be ACTIVE.
+
+        Management/read operations must be able to inspect RETIRED keys.
+        Cryptographic operations must continue to use validate_key().
+        """
+        entry = self.registry.get_key(key_id)
+
+        if entry is None:
+            raise KeyError("key not registered")
+
+        return entry
+
+    def list_registered_keys(self):
+        """Return all registered key metadata, including RETIRED keys."""
+        return self.registry.list_keys()
 
     def register_hsm_key(
         self,
@@ -298,7 +295,8 @@ class RegistryService:
             raise ValueError(f"unsupported HSM key algorithm: {algorithm}")
 
         # If a certificate is supplied, verify that it exists and
-        # is cryptographically bound to this HSM public key.
+        # is cryptographically bound to this HSM public key, then
+        # apply the full role-aware validation policy.
         if certificate_id:
             try:
                 cert_der = hsm.cert(certificate_id)
@@ -307,30 +305,15 @@ class RegistryService:
 
             certificate = x509.load_der_x509_certificate(cert_der)
 
-            hsm_public_der = key["public_key_der"]
-
-            cert_public_der = certificate.public_key().public_bytes(
-                serialization.Encoding.DER,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
+            self.certificate_policy.validate(
+                certificate,
+                role=role,
+                public_key_der=key["public_key_der"],
             )
 
-            if hsm_public_der != cert_public_der:
-                raise ValueError("certificate public key does not match HSM key")
-
-            now = self.clock.now()
-
-            if now < certificate.not_valid_before_utc:
-                raise ValueError("certificate is not yet valid")
-
-            if now > certificate.not_valid_after_utc:
-                raise ValueError("certificate has expired")
-
-        # CSCA has additional certificate requirements.
-        if role == "CSCA":
-            if not certificate_id:
-                raise ValueError("CSCA registration requires certificate_id")
-
-            self._validate_csca_certificate(certificate)
+        # CSCA registration always requires a certificate.
+        if role == "CSCA" and not certificate_id:
+            raise ValueError("CSCA registration requires certificate_id")
 
         self.registry.register_key(
             key_id=key_id,
@@ -345,35 +328,6 @@ class RegistryService:
 
         return self.registry.get_key(key_id)
 
-    def _validate_csca_certificate(self, certificate):
-        self._verify_self_signed_certificate(certificate)
-
-        try:
-            basic_constraints = certificate.extensions.get_extension_for_class(
-                x509.BasicConstraints
-            ).value
-        except x509.ExtensionNotFound:
-            raise ValueError("CSCA certificate missing BasicConstraints")
-
-        if not basic_constraints.ca:
-            raise ValueError("CSCA certificate must have CA=TRUE")
-
-        if basic_constraints.path_length != 0:
-            raise ValueError("CSCA certificate must have pathLenConstraint=0")
-
-        try:
-            key_usage = certificate.extensions.get_extension_for_class(
-                x509.KeyUsage
-            ).value
-        except x509.ExtensionNotFound:
-            raise ValueError("CSCA certificate missing KeyUsage")
-
-        if not key_usage.key_cert_sign:
-            raise ValueError("CSCA certificate must allow keyCertSign")
-
-        if not key_usage.crl_sign:
-            raise ValueError("CSCA certificate must allow cRLSign")
-
     def retire_key(self, key_id: str):
         entry = self.registry.get_key(key_id)
 
@@ -386,3 +340,174 @@ class RegistryService:
         self.registry.retire_key(key_id)
 
         return self.registry.get_key(key_id)
+
+    def check_integrity(self):
+        """Read-only registry <-> HSM consistency report.
+
+        Covers the key registry, HSM key inventory, HSM certificate
+        inventory and key<->certificate bindings. Never mutates the
+        registry or the HSM.
+        """
+        now = self.clock.now().isoformat()
+
+        hsm_certs = {}
+        for o in hsm.objects(1):
+            cid = bytes.fromhex(o["id"]).decode()
+            hsm_certs[cid] = o
+
+        issues = []
+        referenced = {}
+
+        for entry in self.registry.list_keys():
+            object_id = entry["object_id"]
+            certificate_id = entry["certificate_id"]
+
+            # Every registered key must resolve to an HSM object whose
+            # metadata matches the immutable identity fields.
+            try:
+                key = hsm.key(object_id)
+            except KeyError:
+                issues.append(
+                    {
+                        "type": "MISSING_HSM_KEY",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "certificate_id": certificate_id,
+                        "status": entry["status"],
+                    }
+                )
+                continue
+
+            if key["algorithm"] != entry["algorithm"]:
+                issues.append(
+                    {
+                        "type": "KEY_ALGORITHM_MISMATCH",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "registered": entry["algorithm"],
+                        "hsm": key["algorithm"],
+                        "status": entry["status"],
+                    }
+                )
+
+            if entry["algorithm"] == "RSA":
+                registered_params = str(entry["key_parameters"])
+                hsm_params = str(key["bits"])
+            elif entry["algorithm"] == "EC":
+                registered_params = entry["key_parameters"]
+                hsm_params = key["curve"]
+            else:
+                registered_params = hsm_params = None
+
+            if registered_params is not None and registered_params != hsm_params:
+                issues.append(
+                    {
+                        "type": "KEY_PARAMETER_MISMATCH",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "registered": registered_params,
+                        "hsm": hsm_params,
+                        "status": entry["status"],
+                    }
+                )
+
+            if not key["private_present"]:
+                issues.append(
+                    {
+                        "type": "MISSING_PRIVATE_KEY",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "status": entry["status"],
+                    }
+                )
+
+            if not certificate_id:
+                continue
+
+            referenced.setdefault(certificate_id, []).append(
+                entry["key_id"]
+            )
+
+            # registry references a certificate that does not exist on
+            # the HSM -> stale binding
+            if certificate_id not in hsm_certs:
+                issues.append(
+                    {
+                        "type": "MISSING_HSM_CERTIFICATE",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "certificate_id": certificate_id,
+                        "status": entry["status"],
+                    }
+                )
+                continue
+
+            try:
+                cert_der = hsm.cert(certificate_id)
+                certificate = x509.load_der_x509_certificate(cert_der)
+            except Exception as e:
+                issues.append(
+                    {
+                        "type": "UNPARSEABLE_CERTIFICATE",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "certificate_id": certificate_id,
+                        "status": entry["status"],
+                        "reason": str(e),
+                    }
+                )
+                continue
+
+            try:
+                self.certificate_policy.validate(
+                    certificate,
+                    role=entry["role"],
+                    public_key_der=key["public_key_der"],
+                )
+            except CertificatePolicyError as e:
+                issues.append(
+                    {
+                        "type": "CERTIFICATE_POLICY_VIOLATION",
+                        "key_id": entry["key_id"],
+                        "object_id": object_id,
+                        "certificate_id": certificate_id,
+                        "status": entry["status"],
+                        "reason": str(e),
+                    }
+                )
+
+        # HSM certificates with no registry reference -> orphaned.
+        for certificate_id in hsm_certs:
+            if certificate_id not in referenced:
+                issues.append(
+                    {
+                        "type": "UNREFERENCED_CERTIFICATE",
+                        "certificate_id": certificate_id,
+                        "label": hsm_certs[certificate_id].get("label"),
+                    }
+                )
+
+        # Duplicate logical references to the same certificate.
+        for certificate_id, key_ids in referenced.items():
+            if len(key_ids) > 1:
+                issues.append(
+                    {
+                        "type": "DUPLICATE_REFERENCE",
+                        "certificate_id": certificate_id,
+                        "key_ids": key_ids,
+                    }
+                )
+
+        return {
+            "checked_at": now,
+            "summary": {
+                "hsm_certificates": len(hsm_certs),
+                "registered_keys": len(self.registry.list_keys()),
+                "bound_keys": len(referenced),
+                "issues": len(issues),
+            },
+            "issues": issues,
+        }
+
+    def check_certificate_inventory(self):
+        return self.check_integrity()

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import threading
 import pkcs11
 from pkcs11 import (
     Attribute,
@@ -14,6 +15,21 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from asn1crypto import keys as asn1keys, core as asn1core
 from .config import settings
+
+
+# The development token is a single-slot Pico HSM. Concurrent PKCS#11
+# sessions over PC/SC contend for the one token and can deadlock, so all
+# HSM access is serialized with a process-wide reentrant lock.
+_hsm_lock = threading.RLock()
+
+
+def _hsm_locked(func):
+    def wrapper(*args, **kwargs):
+        with _hsm_lock:
+            return func(*args, **kwargs)
+
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 
 class HSM:
@@ -46,6 +62,7 @@ class HSM:
             raise RuntimeError(f"exactly one token required; found {len(slots)}")
         return slots[0]
 
+    @_hsm_locked
     def token(self):
         s = self.slot()
         t = s.get_token()
@@ -57,6 +74,7 @@ class HSM:
             "serial": t.serial.strip(),
         }
 
+    @_hsm_locked
     def mechanisms(self):
         return sorted(m.name for m in self.slot().get_mechanisms())
 
@@ -92,6 +110,7 @@ class HSM:
             None,
         )
 
+    @_hsm_locked
     def key(self, i):
         with self.session() as s:
             p = self.pub(s, i)
@@ -149,9 +168,21 @@ class HSM:
                 }
             raise RuntimeError("unsupported key type")
 
+    @_hsm_locked
+    def _assert_unique(self, i):
+        with self.session() as s:
+            existing = next(
+                iter(s.get_objects({Attribute.ID: i.encode()})),
+                None,
+            )
+        if existing is not None:
+            raise ValueError(f"object_id already exists on HSM: {i}")
+
+    @_hsm_locked
     def gen_rsa(self, i, label, bits):
         if bits not in (2048, 3072, 4096):
             raise ValueError("RSA bits must be 2048, 3072 or 4096")
+        self._assert_unique(i)
         with self.session(True) as s:
             s.generate_keypair(
                 KeyType.RSA,
@@ -163,6 +194,7 @@ class HSM:
             )
         return self.key(i)
 
+    @_hsm_locked
     def gen_ec(self, i, label, curve):
         aliases = {
             "P-256": "secp256r1",
@@ -173,6 +205,7 @@ class HSM:
         curve = aliases.get(curve, curve)
         if curve not in ("secp256r1", "secp384r1", "secp521r1"):
             raise ValueError("unsupported EC curve")
+        self._assert_unique(i)
         with self.session(True) as s:
             dp = s.create_domain_parameters(
                 KeyType.EC,
@@ -187,6 +220,7 @@ class HSM:
             )
         return self.key(i)
 
+    @_hsm_locked
     def sign(self, i, a, data):
         mm = {
             "RSA-SHA256": Mechanism.SHA256_RSA_PKCS,
@@ -200,6 +234,7 @@ class HSM:
                 raise KeyError(i)
             return bytes(k.sign(data, mechanism=mm[a]))
 
+    @_hsm_locked
     def verify(self, i, a, data, sig):
         mm = {
             "RSA-SHA256": Mechanism.SHA256_RSA_PKCS,
@@ -216,6 +251,7 @@ class HSM:
             except PKCS11Error:
                 return False
 
+    @_hsm_locked
     def objects(self, cls=None):
         with self.session() as s:
             it = s.get_objects({Attribute.CLASS: cls} if cls else {})
@@ -233,6 +269,7 @@ class HSM:
                 )
             return out
 
+    @_hsm_locked
     def cert(self, i):
         with self.session() as s:
             o = next(
@@ -250,6 +287,7 @@ class HSM:
                 raise KeyError(i)
             return bytes(o[Attribute.VALUE])
 
+    @_hsm_locked
     def import_cert(self, i, label, der):
         with self.session(True) as s:
             s.create_object(
@@ -264,6 +302,7 @@ class HSM:
             )
         return {"id": i, "label": label, "stored": True}
 
+    @_hsm_locked
     def delete_cert(self, i):
         with self.session(True) as s:
             o = next(

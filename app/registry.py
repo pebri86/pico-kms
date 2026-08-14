@@ -171,6 +171,20 @@ class Registry:
                 ("RETIRED", now, key_id),
             )
 
+    def find_keys_by_certificate_id(self, certificate_id: str):
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM key_registry
+                WHERE certificate_id = ?
+                ORDER BY key_id
+                """,
+                (certificate_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def update_certificate(self, key_id: str, certificate_id: str):
         if not key_id:
             raise ValueError("key_id is required")

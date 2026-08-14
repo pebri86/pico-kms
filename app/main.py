@@ -1,5 +1,6 @@
 from __future__ import annotations
-import base64, binascii, hashlib
+import base64, binascii, hashlib, logging
+from contextlib import asynccontextmanager
 from fastapi import (
     Depends,
     FastAPI,
@@ -10,18 +11,41 @@ import secrets
 from pydantic import BaseModel, Field
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from .hsm import hsm
-from .registry_service import RegistryService, AuthorizationError
+from .registry_service import (
+    RegistryService,
+    AuthorizationError,
+    IntegrityError,
+)
 from typing import Literal
-from .audit import audit_sign, audit_verify, audit_api_auth, audit_admin_auth
+from .audit import (
+    audit_sign,
+    audit_verify,
+    audit_api_auth,
+    audit_admin_auth,
+    audit_key_event,
+    audit_cert_event,
+)
 from .config import settings
 
-app = FastAPI(title="PicoHSM ePassport KMS Phase 1", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        registry_service.run_startup_integrity_check()
+    except Exception:
+        pass
+    yield
+
+
+app = FastAPI(
+    title="PicoHSM ePassport KMS Phase 1",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 bearer_scheme = HTTPBearer(
     scheme_name="PicoKMSBearer",
 )
-
-
 def require_admin_auth(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
@@ -103,18 +127,8 @@ class EC(BaseModel):
 
 
 class Sign(BaseModel):
-    algorithm: Literal[
-        "RSA-SHA256",
-        "ECDSA-SHA256",
-    ]
-
-    operation: Literal[
-        "CERTIFICATE_SIGN",
-        "CRL_SIGN",
-        "DOCUMENT_SIGN",
-        "CV_CERTIFICATE_SIGN",
-    ]
-
+    algorithm: str
+    operation: str
     data: str
 
 
@@ -160,12 +174,30 @@ def b64(v, n):
     return data
 
 
+def _internal_error(e: Exception, detail: str = "internal error"):
+    """Sanitize unexpected internal failures.
+
+    PKCS#11 internals, filesystem paths, HSM session details and
+    tracebacks must never reach the client. Log the real error and
+    surface a generic message only.
+    """
+    logging.getLogger("picokms.api").exception("%s: %s", detail, e)
+    raise HTTPException(503, detail) from e
+
+
 @app.get("/health")
 def health():
     try:
-        return {"status": "ok", "hsm": "connected", "token": hsm.token()}
+        return {
+            "status": "ok",
+            "hsm": "connected",
+            "token": hsm.token(),
+            "fail_closed": registry_service.fail_closed,
+            "integrity_issues": len(registry_service.integrity_issues),
+        }
     except Exception as e:
-        return {"status": "degraded", "hsm": "unavailable", "error": str(e)}
+        logging.getLogger("picokms.api").exception("health check failed: %s", e)
+        return {"status": "degraded", "hsm": "unavailable"}
 
 
 @app.get(
@@ -176,7 +208,7 @@ def token():
     try:
         return hsm.token()
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
 @app.get(
@@ -187,7 +219,7 @@ def mechanisms():
     try:
         return {"mechanisms": hsm.mechanisms()}
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
 @app.get(
@@ -198,7 +230,65 @@ def objects():
     try:
         return {"objects": hsm.objects()}
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
+
+
+@app.get(
+    "/v1/phase1/keys",
+    dependencies=[Depends(require_admin_auth)],
+)
+def list_registered_keys():
+    try:
+        entries = registry_service.list_registered_keys()
+
+        return {
+            "keys": [
+                {
+                    "key_id": entry["key_id"],
+                    "role": entry["role"],
+                    "object_id": entry["object_id"],
+                    "label": entry["label"],
+                    "algorithm": entry["algorithm"],
+                    "key_parameters": entry["key_parameters"],
+                    "certificate_id": entry["certificate_id"],
+                    "status": entry["status"],
+                    "created_at": entry["created_at"],
+                    "updated_at": entry["updated_at"],
+                }
+                for entry in entries
+            ]
+        }
+
+    except Exception as e:
+        _internal_error(e)
+
+
+@app.get(
+    "/v1/phase1/keys/{i}",
+    dependencies=[Depends(require_admin_auth)],
+)
+def get_registered_key(i: str):
+    try:
+        entry = registry_service.get_registered_key(i)
+
+        return {
+            "key_id": entry["key_id"],
+            "role": entry["role"],
+            "object_id": entry["object_id"],
+            "label": entry["label"],
+            "algorithm": entry["algorithm"],
+            "key_parameters": entry["key_parameters"],
+            "certificate_id": entry["certificate_id"],
+            "status": entry["status"],
+            "created_at": entry["created_at"],
+            "updated_at": entry["updated_at"],
+        }
+
+    except KeyError:
+        raise HTTPException(404, "key not registered")
+
+    except Exception as e:
+        _internal_error(e)
 
 
 @app.post(
@@ -215,6 +305,26 @@ def register_key(r: RegisterKey):
             certificate_id=r.certificate_id,
         )
 
+        audit_ok = audit_key_event(
+            event="KEY_REGISTER",
+            result="SUCCESS",
+            key_id=entry["key_id"],
+            object_id=entry["object_id"],
+            role=entry["role"],
+            algorithm=entry["algorithm"],
+        )
+
+        if entry["certificate_id"]:
+            audit_cert_event(
+                event="CERT_BIND",
+                result="SUCCESS",
+                certificate_id=entry["certificate_id"],
+                key_id=entry["key_id"],
+                object_id=entry["object_id"],
+                role=entry["role"],
+                algorithm=entry["algorithm"],
+            )
+
         return {
             "key_id": entry["key_id"],
             "role": entry["role"],
@@ -224,6 +334,7 @@ def register_key(r: RegisterKey):
             "key_parameters": entry["key_parameters"],
             "certificate_id": entry["certificate_id"],
             "status": entry["status"],
+            "audit_status": "OK" if audit_ok else "DEGRADED",
         }
 
     except KeyError:
@@ -239,10 +350,7 @@ def register_key(r: RegisterKey):
         )
 
     except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=str(e),
-        )
+        _internal_error(e, "key registration failed")
 
 
 @app.post(
@@ -252,6 +360,15 @@ def register_key(r: RegisterKey):
 def retire_key(i: str):
     try:
         entry = registry_service.retire_key(i)
+
+        audit_key_event(
+            event="KEY_RETIRE",
+            result="SUCCESS",
+            key_id=entry["key_id"],
+            object_id=entry["object_id"],
+            role=entry["role"],
+            algorithm=entry["algorithm"],
+        )
 
         return {
             "key_id": entry["key_id"],
@@ -266,7 +383,7 @@ def retire_key(i: str):
         raise HTTPException(400, str(e))
 
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
 @app.post(
@@ -276,6 +393,16 @@ def retire_key(i: str):
 def gen_rsa(r: RSA):
     try:
         k = hsm.gen_rsa(r.object_id, r.label, r.bits)
+
+        audit_key_event(
+            event="KEY_GENERATE",
+            result="SUCCESS",
+            key_id=r.object_id,
+            object_id=r.object_id,
+            role="UNASSIGNED",
+            algorithm="RSA",
+            reason=f"bits={r.bits}",
+        )
 
         return {
             "object_id": k["object_id"],
@@ -288,7 +415,7 @@ def gen_rsa(r: RSA):
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
 @app.post(
@@ -298,6 +425,16 @@ def gen_rsa(r: RSA):
 def gen_ec(r: EC):
     try:
         k = hsm.gen_ec(r.object_id, r.label, r.curve)
+
+        audit_key_event(
+            event="KEY_GENERATE",
+            result="SUCCESS",
+            key_id=r.object_id,
+            object_id=r.object_id,
+            role="UNASSIGNED",
+            algorithm="EC",
+            reason=f"curve={r.curve}",
+        )
 
         return {
             "object_id": k["object_id"],
@@ -310,7 +447,7 @@ def gen_ec(r: EC):
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
 @app.post(
@@ -352,6 +489,9 @@ def sign(i: str, r: Sign):
 
     except HTTPException:
         raise
+
+    except IntegrityError as e:
+        _internal_error(e)
 
     except AuthorizationError as e:
         entry = registry_service.registry.get_key_by_object_id(i)
@@ -412,7 +552,7 @@ def sign(i: str, r: Sign):
                 reason=str(e),
             )
 
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
 @app.post(
@@ -498,20 +638,127 @@ def verify(i: str, r: Verify):
                 reason=str(e),
             )
 
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
-@app.get("/v1/phase1/certificates")
+
+class CertificateUpdate(BaseModel):
+    certificate_id: str
+
+
+@app.put(
+    "/v1/phase1/keys/{key_id}/certificate",
+    dependencies=[Depends(require_admin_auth)],
+)
+def update_key_certificate(
+    key_id: str,
+    r: CertificateUpdate,
+):
+    try:
+        registry_service.update_certificate(
+            key_id,
+            r.certificate_id,
+        )
+
+        entry = registry_service.get_registered_key(key_id)
+
+        audit_cert_event(
+            event="CERT_UPDATE",
+            result="SUCCESS",
+            certificate_id=r.certificate_id,
+            key_id=entry["key_id"],
+            object_id=entry["object_id"],
+            role=entry["role"],
+            algorithm=entry["algorithm"],
+        )
+
+        return {
+            "key_id": entry["key_id"],
+            "object_id": entry["object_id"],
+            "certificate_id": entry["certificate_id"],
+            "status": entry["status"],
+        }
+
+    except KeyError:
+        audit_cert_event(
+            event="CERT_UPDATE",
+            result="DENIED",
+            certificate_id=r.certificate_id,
+            key_id=key_id,
+            reason="key not registered",
+        )
+        raise HTTPException(404, "key not registered")
+
+    except ValueError as e:
+        entry = None
+
+        try:
+            entry = registry_service.get_registered_key(key_id)
+        except Exception:
+            pass
+
+        audit_cert_event(
+            event="CERT_UPDATE",
+            result="DENIED",
+            certificate_id=r.certificate_id,
+            key_id=key_id,
+            object_id=entry["object_id"] if entry else None,
+            role=entry["role"] if entry else None,
+            reason=str(e),
+        )
+        raise HTTPException(400, str(e))
+
+    except Exception as e:
+        audit_cert_event(
+            event="CERT_UPDATE",
+            result="FAILURE",
+            certificate_id=r.certificate_id,
+            key_id=key_id,
+            reason=str(e),
+        )
+        _internal_error(e)
+
+
+@app.get(
+    "/v1/phase1/integrity/certificates",
+    dependencies=[Depends(require_admin_auth)],
+)
+def certificate_integrity():
+    try:
+        return registry_service.check_certificate_inventory()
+    except Exception as e:
+        _internal_error(e)
+
+
+@app.get(
+    "/v1/phase1/integrity",
+    dependencies=[Depends(require_admin_auth)],
+)
+def integrity_report():
+    try:
+        report = registry_service.check_integrity()
+        report["fail_closed"] = registry_service.fail_closed
+        report["startup_issues"] = len(registry_service.integrity_issues)
+        return report
+    except Exception as e:
+        _internal_error(e)
+
+
+@app.get(
+    "/v1/phase1/certificates",
+    dependencies=[Depends(require_admin_auth)],
+)
 def certs():
     try:
         out = []
         for o in hsm.objects(1):
             try:
-                der = hsm.cert(o["id"])
+                cert_id = bytes.fromhex(o["id"]).decode()
+                der = hsm.cert(cert_id)
                 c = x509.load_der_x509_certificate(der)
                 out.append(
                     {
-                        "id": o["id"],
+                        "id": cert_id,
                         "label": o["label"],
                         "subject": c.subject.rfc4514_string(),
                         "issuer": c.issuer.rfc4514_string(),
@@ -523,10 +770,13 @@ def certs():
                 out.append(o)
         return {"certificates": out}
     except Exception as e:
-        raise HTTPException(503, str(e))
+        _internal_error(e)
 
 
-@app.get("/v1/phase1/certificates/{i}")
+@app.get(
+    "/v1/phase1/certificates/{i}",
+    dependencies=[Depends(require_admin_auth)],
+)
 def cert(i: str):
     try:
         der = hsm.cert(i)
@@ -542,12 +792,12 @@ def cert(i: str):
     except KeyError:
         raise HTTPException(404, "certificate not found")
     except Exception as e:
-        raise HTTPException(422, str(e))
+        _internal_error(e, "certificate could not be parsed")
 
 
 @app.post(
     "/v1/phase1/certificates/import",
-    dependencies=[Depends(require_api_auth)],
+    dependencies=[Depends(require_admin_auth)],
 )
 def import_cert(r: Cert):
     try:
@@ -559,6 +809,15 @@ def import_cert(r: Cert):
             )
         der = c.public_bytes(serialization.Encoding.DER)
         hsm.import_cert(r.object_id, r.label, der)
+
+        audit_cert_event(
+            event="CERT_IMPORT",
+            result="SUCCESS",
+            certificate_id=r.object_id,
+            object_id=r.object_id,
+            algorithm="RSA" if isinstance(c.public_key(), rsa.RSAPublicKey) else "EC",
+        )
+
         return {
             "id": r.object_id,
             "label": r.label,
@@ -566,19 +825,58 @@ def import_cert(r: Cert):
             "issuer": c.issuer.rfc4514_string(),
             "sha256": hashlib.sha256(der).hexdigest(),
         }
-    except Exception as e:
+    except HTTPException:
+        raise
+
+    except (ValueError, binascii.Error) as e:
         raise HTTPException(400, str(e))
+
+    except Exception as e:
+        _internal_error(e, "certificate import failed")
 
 
 @app.delete(
     "/v1/phase1/certificates/{i}",
-    dependencies=[Depends(require_api_auth)],
+    dependencies=[Depends(require_admin_auth)],
 )
 def delete_cert(i: str):
     try:
-        hsm.delete_cert(i)
-        return {"deleted": True, "id": i}
+        registry_service.delete_certificate(i)
+
+        audit_cert_event(
+            event="CERT_DELETE",
+            result="SUCCESS",
+            certificate_id=i,
+        )
+
+        return {
+            "deleted": True,
+            "id": i,
+        }
+
     except KeyError:
+        audit_cert_event(
+            event="CERT_DELETE",
+            result="DENIED",
+            certificate_id=i,
+            reason="certificate not found",
+        )
         raise HTTPException(404, "certificate not found")
+
+    except ValueError as e:
+        audit_cert_event(
+            event="CERT_DELETE",
+            result="DENIED",
+            certificate_id=i,
+            reason=str(e),
+        )
+        raise HTTPException(400, str(e))
+
     except Exception as e:
-        raise HTTPException(503, str(e))
+        audit_cert_event(
+            event="CERT_DELETE",
+            result="FAILURE",
+            certificate_id=i,
+            reason=str(e),
+        )
+        _internal_error(e)
